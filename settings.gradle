@@ -1,0 +1,2 @@
+include ':app', 'PEBBLE_KIT'
+include ':PEBBLE_KIT'
