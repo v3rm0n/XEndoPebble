@@ -1,3 +1,4 @@
 <resources>
-    <string name="app_name">XposedEndoPebble</string>
+    <string name="app_name">XEndoPebble</string>
+    <string name="speed_pace">Show pace instead of speed</string>
 </resources>

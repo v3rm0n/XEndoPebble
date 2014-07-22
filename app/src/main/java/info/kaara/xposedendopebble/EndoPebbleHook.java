@@ -1,17 +1,12 @@
 package info.kaara.xposedendopebble;
 
-import android.app.Activity;
 import android.content.Context;
 
 import com.getpebble.android.kit.Constants;
-import com.getpebble.android.kit.PebbleKit;
-import com.getpebble.android.kit.util.PebbleDictionary;
-
-import java.util.Random;
-import java.util.concurrent.TimeUnit;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
-import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.IXposedHookZygoteInit;
+import de.robv.android.xposed.XSharedPreferences;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
@@ -19,85 +14,115 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * Created by vermon on 19/07/14.
  */
-public class EndoPebbleHook implements IXposedHookLoadPackage {
+public class EndoPebbleHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
 
-    private final Random rand = new Random();
+    private static final String PACKAGE_NAME = EndoPebbleHook.class.getPackage().getName();
+    private static XSharedPreferences pref;
+
+    private PebbleSports pebbleSports;
+    private PebbleSportsDataHandler pebbleSportsDataHandler;
+    private Endomondo endomondo;
 
     @Override
-    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam loadPackageParam) throws Throwable {
+    public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam loadPackageParam) throws Throwable {
         if (!loadPackageParam.packageName.startsWith("com.endomondo.android")) {
             return;
         }
 
         XposedBridge.log("Loaded " + loadPackageParam.packageName);
 
-        final Class<?> workoutServiceClass = XposedHelpers.findClass("com.endomondo.android.common.workout.WorkoutService", loadPackageParam.classLoader);
+        endomondo = new Endomondo(loadPackageParam.classLoader);
 
-        XposedHelpers.findAndHookMethod(workoutServiceClass, "handleEvent", "com.endomondo.android.common.generic.model.EndoEvent", new XC_MethodHook() {
-
-            protected void afterHookedMethod(MethodHookParam param) throws java.lang.Throwable {
-                Object event = param.args[0];
-
-                String eventType = XposedHelpers.getObjectField(event, "typeEvent").toString();
-                Activity activity = (Activity) XposedHelpers.getStaticObjectField(workoutServiceClass, "MAIN_ACTIVITY");
-
-                if ("CMD_START_WORKOUT_EVT".equals(eventType)) {
-                    startWatchApp(activity.getApplicationContext());
-                } else if ("CMD_STOP_WORKOUT_EVT".equals(eventType)) {
-                    stopWatchApp(activity.getApplicationContext());
-                } else if ("WORKOUT_TRACK_TIMER_EVT".equals(eventType)) {
-                    Object workout = XposedHelpers.getObjectField(param.thisObject, "mWorkout");
-
-                    long duration = XposedHelpers.getLongField(workout, "duration");
-                    float speed = XposedHelpers.getFloatField(workout, "speed");
-                    float distanceInKm = XposedHelpers.getFloatField(workout, "distanceInKm");
-
-                    updateWatchApp(activity.getApplicationContext(), duration, speed, distanceInKm);
+        endomondo.handleWorkoutEvent(new Endomondo.WorkoutEventHandler() {
+            @Override
+            public void handle(Endomondo.Event event, Object workoutService, Context context) {
+                switch (event) {
+                    case START:
+                        pref.reload();
+                        startWorkout(context);
+                        break;
+                    case STOP:
+                        stopWorkout();
+                        break;
+                    case TRACK:
+                        trackTimer(context, workoutService, endomondo.isImperial());
+                        break;
+                    case PAUSE:
+                        XposedBridge.log("Workout paused");
+                        break;
+                    case RESUME:
+                        XposedBridge.log("Workout resumed");
+                    case UNKNOWN:
+                        //Ignore
+                        break;
+                    default:
+                        throw new RuntimeException("Event type doesn't exist: " + event);
                 }
             }
-
         });
     }
 
-    // Send a broadcast to launch the specified application on the connected Pebble
-    public void startWatchApp(Context context) {
-        XposedBridge.log("Starting watchapp");
-        PebbleKit.startAppOnPebble(context, Constants.SPORTS_UUID);
-    }
+    private void startWorkout(final Context context) {
+        if (pebbleSports == null) {
+            if (pebbleSportsDataHandler != null) {
+                pebbleSportsDataHandler.unregisterSportsDataHandler();
+            }
+            pebbleSports = new PebbleSports(context);
+            pebbleSports.start();
+            pebbleSportsDataHandler = new PebbleSportsDataHandler(context);
+            pebbleSportsDataHandler.init(new PebbleSportsDataHandler.PebbleSportsStateHandler() {
+                @Override
+                public void handle(int oldSportsState, int newSportsState) {
 
-    // Send a broadcast to close the specified application on the connected Pebble
-    public void stopWatchApp(Context context) {
-        XposedBridge.log("Stopping watchapp");
-        PebbleKit.closeAppOnPebble(context, Constants.SPORTS_UUID);
-    }
+                    XposedBridge.log("Pebble state changed to " + newSportsState);
 
-    // Push (distance, time, pace) data to be displayed on Pebble's Sports app.
-    //
-    // To simplify formatting, values are transmitted to the watch as strings.
-    public void updateWatchApp(Context context, long duration, float speed, float distanceInKm) {
-        String time = null;
-        long hours = TimeUnit.SECONDS.toHours(duration);
-        if (hours > 0) {
-            long minutes = TimeUnit.SECONDS.toMinutes(duration - TimeUnit.HOURS.toSeconds(hours));
-            time = String.format("%02d:%02d", hours, minutes);
-        } else {
-            long minutes = TimeUnit.SECONDS.toMinutes(duration);
-            long seconds = duration - TimeUnit.MINUTES.toSeconds(minutes);
-            time = String.format("%02d:%02d", minutes, seconds);
+                    //Wrong way around, but it works. Why??
+                    if (newSportsState == Constants.SPORTS_STATE_PAUSED) {
+                        endomondo.resumeWorkout(context);
+                    } else if (newSportsState == Constants.SPORTS_STATE_RUNNING) {
+                        endomondo.pauseWorkout(context);
+                    }
+                }
+            });
         }
-        String distance = String.format("%02.02f", distanceInKm);
-
-        XposedBridge.log("Speed " + speed);
-        String speedLabel = String.format("%02d:%02d", rand.nextInt(10), rand.nextInt(60));
-
-        PebbleDictionary data = new PebbleDictionary();
-        data.addString(Constants.SPORTS_TIME_KEY, time);
-        data.addString(Constants.SPORTS_DISTANCE_KEY, distance);
-        data.addString(Constants.SPORTS_DATA_KEY, speedLabel);
-
-        data.addUint8(Constants.SPORTS_LABEL_KEY, (byte) Constants.SPORTS_DATA_SPEED);
-        data.addUint8(Constants.SPORTS_UNITS_KEY, (byte) Constants.SPORTS_UNITS_METRIC);
-
-        PebbleKit.sendDataToPebble(context, Constants.SPORTS_UUID, data);
+        XposedBridge.log("Workout started");
     }
+
+    private void stopWorkout() {
+        if (pebbleSportsDataHandler != null) {
+            pebbleSportsDataHandler.destroy();
+            pebbleSportsDataHandler = null;
+        }
+        if (pebbleSports != null) {
+            pebbleSports.stop();
+            pebbleSports = null;
+
+        }
+        XposedBridge.log("Workout stopped");
+    }
+
+    private void trackTimer(final Context context, Object workoutService, boolean imperial) {
+        if (pebbleSports == null) {
+            pref.reload();
+            startWorkout(context);
+        }
+        Object workout = XposedHelpers.getObjectField(workoutService, "mWorkout");
+
+        long duration = XposedHelpers.getLongField(workout, "duration");
+        float distanceInKm = XposedHelpers.getFloatField(workout, "distanceInKm");
+
+        float speed3 = XposedHelpers.getFloatField(workoutService, "mSpeed3");
+
+        pebbleSports.update(duration, speed3, distanceInKm, imperial, isShowPace());
+    }
+
+    private boolean isShowPace() {
+        return pref.getBoolean(SettingsActivity.SPEED_PACE, false);
+    }
+
+    @Override
+    public void initZygote(StartupParam startupParam) throws Throwable {
+        pref = new XSharedPreferences(PACKAGE_NAME);
+    }
+
 }
